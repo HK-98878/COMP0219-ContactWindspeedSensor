@@ -12,6 +12,7 @@
 
 #define EXTRACT_ANGLE_DATA(data, idx) (((data)[(idx)] << 6) | ((data)[(idx)+1] & 0x3F))
 
+
 HAL_StatusTypeDef AS5048_CheckSetup(I2C_HandleTypeDef* i2c_handle, const uint8_t sensor_addr) {
   uint8_t data;
   HAL_StatusTypeDef status = HAL_I2C_Mem_Read(i2c_handle, sensor_addr, AS5048B_DIAG_ADDR,
@@ -20,6 +21,9 @@ HAL_StatusTypeDef AS5048_CheckSetup(I2C_HandleTypeDef* i2c_handle, const uint8_t
   return HAL_BUSY;
 }
 
+uint16_t AS5048_ConvertAngleBuffer(uint8_t angle_buffer[2]) {
+  return EXTRACT_ANGLE_DATA(angle_buffer, 0);
+}
 HAL_StatusTypeDef AS5048_ReadAngle(I2C_HandleTypeDef* i2c_handle, const uint8_t sensor_addr, uint16_t *angle) {
   uint8_t data[AS5048B_ANGLE_DATA_SIZE]; 
   HAL_StatusTypeDef status = HAL_I2C_Mem_Read(i2c_handle, sensor_addr, AS5048B_ANGLE_ADDR,
@@ -28,6 +32,10 @@ HAL_StatusTypeDef AS5048_ReadAngle(I2C_HandleTypeDef* i2c_handle, const uint8_t 
     *angle = EXTRACT_ANGLE_DATA(data, 0);
   }
   return status;
+}
+HAL_StatusTypeDef AS5048_ReadAngleDMA(I2C_HandleTypeDef* i2c_handle, const uint8_t sensor_addr, uint8_t angle_buffer[2]) {
+  return HAL_I2C_Mem_Read_DMA(i2c_handle, sensor_addr, AS5048B_ANGLE_ADDR, 
+    I2C_MEMADD_SIZE_8BIT, angle_buffer, AS5048B_ANGLE_DATA_SIZE);
 }
 
 HAL_StatusTypeDef AS5048_ReadAngle_Safe(I2C_HandleTypeDef* i2c_handle, const uint8_t sensor_addr, uint16_t *angle) {

@@ -30,7 +30,7 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -u _printf_float")
+# set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -u _printf_float")
 
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})

@@ -18,12 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "stm32f4xx_hal.h"
-#include "stm32f4xx_hal_def.h"
-#include "as5048b.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "as5048b.h"
+#include "stm32f4xx_hal_def.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -47,6 +46,9 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
+DMA_HandleTypeDef hdma_i2c1_rx;
+
+TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart2;
 
@@ -57,8 +59,10 @@ UART_HandleTypeDef huart2;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -71,8 +75,72 @@ void UART_Print(const char *message) {
     (uint16_t)strlen(message), 1000);
 }
 #define ENCODER_I2C_ADDR (0b1000000 << 1) // 1 bit Lshift for HAL API
-#define ENCODER_ANGLE_ADDR 0xFE
-#define ENCODER_ANGLE_DATA_SIZE 2
+struct raw_encoder_data {
+  uint8_t raw[2];
+  uint32_t seq;
+};
+
+// 
+// Ring buffer used to stash values from the I2C ISR
+//
+#define RING_BUFFER_COUNT 64
+static struct {
+  struct raw_encoder_data buffer[RING_BUFFER_COUNT]; // Buffering raw encoder counts
+  volatile uint16_t head;
+  volatile uint16_t tail;
+} ring_buffer;
+int RingPush(struct raw_encoder_data *data) {
+  uint16_t next = (ring_buffer.head + 1) % RING_BUFFER_COUNT;
+  if (next == ring_buffer.tail) return 0;      // full
+  ring_buffer.buffer[ring_buffer.head] = *data;
+  __DMB();
+  ring_buffer.head = next;
+  return 1;
+}
+int RingPop(struct raw_encoder_data* data) {
+  if (ring_buffer.tail == ring_buffer.head) return 0;  // empty
+  *data = ring_buffer.buffer[ring_buffer.tail];
+  __DMB();
+  ring_buffer.tail = (ring_buffer.tail + 1) % RING_BUFFER_COUNT;
+  return 1;
+}
+static inline int RingAvailable() { return ring_buffer.tail != ring_buffer.head; };
+
+
+//
+// I2C ISRs for non-blocking DMA read
+//
+static uint8_t rx_buf[2];
+static uint32_t rx_buf_seq_idx = 0;
+
+static volatile uint8_t  i2c_busy = 0;
+static volatile uint32_t overruns = 0, i2c_errors = 0;
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+  if (htim->Instance != TIM3) return;
+  rx_buf_seq_idx += 1; // Increment this regardless of success/fail on the read to detect skipped reads
+
+  if (i2c_busy) { overruns++; return; } // previous read not finished
+  i2c_busy = 1;
+  if (AS5048_ReadAngleDMA(&hi2c1, ENCODER_I2C_ADDR, rx_buf) != HAL_OK) {
+    i2c_busy = 0;
+    overruns++;
+  }
+}
+
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
+  if (hi2c->Instance != I2C1) return;
+
+  struct raw_encoder_data dat = { .seq=rx_buf_seq_idx };
+  memcpy(&dat.raw, rx_buf, 2);
+  if(!RingPush(&dat)) ++overruns;
+  i2c_busy = 0;
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
+  i2c_errors++;
+  i2c_busy = 0;   // consider bus recovery here if errors persist
+}
 
 /* USER CODE END 0 */
 
@@ -93,7 +161,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  HAL_DBGMCU_EnableDBGSleepMode(); // Prevents board from locking under debug mode due to __WFI
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -105,8 +173,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_USART2_UART_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
   // Check encoder is connected and active
@@ -124,30 +194,27 @@ int main(void)
   } while(status != HAL_OK);
   UART_Print("Encoder self-setup complete!\r\n");
 
-  uint16_t angle;
-  uint8_t agc;
   char msg[100];
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  
+  struct raw_encoder_data data;
+  HAL_TIM_Base_Start_IT(&htim3); // Start sensor read timer
   while (1)
   {
     /* USER CODE END WHILE */
-    
+
     /* USER CODE BEGIN 3 */
-    HAL_StatusTypeDef angle_status = AS5048_ReadAngle(&hi2c1, ENCODER_I2C_ADDR, &angle);
-    if(angle_status == HAL_OK) {
-      float out = (angle - 1e4) / 50;
-      // snprintf(msg, sizeof(msg), "Angle: %hu | %hu\r\n", angle, (uint16_t)agc);
-      snprintf(msg, sizeof(msg), "%f\r\n",out);
+    while(RingPop(&data)) {
+      uint16_t value = AS5048_ConvertAngleBuffer(data.raw);
+      snprintf(msg, sizeof(msg), "%lu,%hu \r\n", data.seq, value);
       UART_Print(msg);
     }
-    else
-      UART_Print("Read failed\r\n");
 
-    HAL_Delay(5);
+    __WFI(); // Wait for any interrupt (after ISR completion)
   }
   /* USER CODE END 3 */
 }
@@ -233,6 +300,51 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 41;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -248,7 +360,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 921600;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -262,6 +374,22 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
 
