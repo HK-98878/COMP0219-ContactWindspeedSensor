@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 /* USER CODE END Includes */
 
@@ -75,38 +76,6 @@ void UART_Print(const char *message) {
     (uint16_t)strlen(message), 1000);
 }
 #define ENCODER_I2C_ADDR (0b1000000 << 1) // 1 bit Lshift for HAL API
-struct raw_encoder_data {
-  uint8_t raw[2];
-  uint32_t seq;
-};
-
-// 
-// Ring buffer used to stash values from the I2C ISR
-//
-#define RING_BUFFER_COUNT 64
-static struct {
-  struct raw_encoder_data buffer[RING_BUFFER_COUNT]; // Buffering raw encoder counts
-  volatile uint16_t head;
-  volatile uint16_t tail;
-} ring_buffer;
-int RingPush(struct raw_encoder_data *data) {
-  uint16_t next = (ring_buffer.head + 1) % RING_BUFFER_COUNT;
-  if (next == ring_buffer.tail) return 0;      // full
-  ring_buffer.buffer[ring_buffer.head] = *data;
-  __DMB();
-  ring_buffer.head = next;
-  return 1;
-}
-int RingPop(struct raw_encoder_data* data) {
-  if (ring_buffer.tail == ring_buffer.head) return 0;  // empty
-  *data = ring_buffer.buffer[ring_buffer.tail];
-  __DMB();
-  ring_buffer.tail = (ring_buffer.tail + 1) % RING_BUFFER_COUNT;
-  return 1;
-}
-static inline int RingAvailable() { return ring_buffer.tail != ring_buffer.head; };
-
-
 //
 // I2C ISRs for non-blocking DMA read
 //
@@ -116,12 +85,36 @@ static uint32_t rx_buf_seq_idx = 0;
 static volatile uint8_t  i2c_busy = 0;
 static volatile uint32_t overruns = 0, i2c_errors = 0;
 
+// Block accumulation state. Shared between the TIM3 and I2C1 ISRs
+// Skipped/failed reads still "accumulate" in timer ticks, so block is always dispatched at
+// 200Hz, even if I2C delays/fails
+static struct accumulation_block cur;
+static uint8_t  tick_in_block = 0;  // 0..AVG_N-1, position of the next tick in the block
+static uint32_t block_id = 0;       // incremented every time a block is closed
+static uint32_t inflight_block_id;  // block_id at the time the in-flight read was started
+
+static void CloseBlock(void) {
+  if (cur.n > 0) {                  // all reads failed -> no output for this period
+    if (!RingPush(&cur)) ++overruns;
+  }
+  cur.n = 0;
+  cur.sum = 0;
+  cur.start_idx = rx_buf_seq_idx;
+  ++block_id;
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance != TIM3) return;
   rx_buf_seq_idx += 1; // Increment this regardless of success/fail on the read to detect skipped reads
 
+  // Every AVG_N ticks, the previous block has had all its reads issued (and, at
+  // ~120 us per read vs a 500 us period, completed), so close it now.
+  if (tick_in_block == 0) CloseBlock();
+  if (++tick_in_block == AVG_N) tick_in_block = 0;
+
   if (i2c_busy) { overruns++; return; } // previous read not finished
   i2c_busy = 1;
+  inflight_block_id = block_id;
   if (AS5048_ReadAngleDMA(&hi2c1, ENCODER_I2C_ADDR, rx_buf) != HAL_OK) {
     i2c_busy = 0;
     overruns++;
@@ -129,17 +122,127 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 }
 
 void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
+  static uint16_t enc_ref;
+  static uint8_t enc_ref_set = 0;
   if (hi2c->Instance != I2C1) return;
-
-  struct raw_encoder_data dat = { .seq=rx_buf_seq_idx };
-  memcpy(&dat.raw, rx_buf, 2);
-  if(!RingPush(&dat)) ++overruns;
   i2c_busy = 0;
+
+  // A read that was still in flight when its block closed belongs to a block
+  // that has already been pushed; drop it rather than mis-attribute it.
+  if (inflight_block_id != block_id) { overruns++; return; }
+
+  uint16_t raw = AS5048_ConvertAngleBuffer(rx_buf);
+
+  // Fixed reference, latched once from the first sample after boot, used 
+  // for wrap detection/unwrapping
+  if(!enc_ref_set) {
+    enc_ref = raw;
+    enc_ref_set = 1;
+  }
+  cur.ref = enc_ref;
+
+  // Manage encoder wrap (modular difference to the fixed ref, signed result)
+  int32_t d = (int32_t)raw - cur.ref;
+  if(d > ENC_RANGE / 2) d -= ENC_RANGE;
+  if(d < -ENC_RANGE / 2) d += ENC_RANGE;
+  cur.sum += d;
+  ++cur.n;
 }
 
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
+  if (hi2c->Instance != I2C1) return;
   i2c_errors++;
   i2c_busy = 0;   // consider bus recovery here if errors persist
+}
+
+// Air density calibrated in the VDAS
+#define RHO 1.2056f
+#ifndef RHO // Fallback
+#define RHO 1.2056f      // kg/m^3, VDAS reference density
+#endif
+
+// Constants
+#define SQRT_A 0.059487f  // Pa/count
+
+#define QUAD_A1  0.0447421f
+#define QUAD_A2  2.12011e-5f
+
+// v = k sqrt(theta), theta = c0 - filtered count (counts, positive with airspeed)
+float sqrt_model(float theta) {
+  const static float c = 2.0f * SQRT_A / RHO;
+
+  if(theta <= 0.0f) return 0.0f;
+  return sqrtf(c * theta);
+}
+
+// v = k sqrt(theta) sqrt(1 + b theta), theta = c0 - filtered count
+float quadratic_model(float theta) {
+  // Roll k inside the sqrt for fewer calculations
+  const static float c1 = 2.0f * QUAD_A1 / RHO;
+  const static float c2 = 2.0f * QUAD_A2 / RHO;
+
+  if(theta <= 0.0f) return 0.0f;
+  return sqrtf(theta * (c1 + c2 * theta));
+}
+
+float cubic_model(float theta) {
+  const static float scale = 282.1641f;
+  const static float a = 1.37421e-8 / scale;
+  const static float b = -0.00043698 / scale;
+  const static float c = 4.63856 / scale;
+
+  if(theta <= 0.0f) return 0.0f;
+  return a*powf(theta, 3.0) + b*powf(theta, 2.0) + c*theta;
+}
+
+
+
+//
+// Tare (c0) procedure
+//
+// c0 = mean count over a still-air period, taken at boot and on each B1 press.
+// Never re-zeroed automatically. Output is silent while taring.
+//
+#define TARE_BLOCKS        400   // tare period in blocks: 400 x AVG_N samples ~= 2 s
+#define TARE_BLINK_BLOCKS  20    // LD2 toggle period while taring (~100 ms)
+// Stillness check: std dev of the 10-sample block means over the tare period.
+#define TARE_MAX_STD       2.0f  // counts
+
+struct tare_state {
+  int32_t  sum;      // sum of block sums (counts rel. to fixed ref); max 400*10*8192 ~= 33M
+  uint32_t n;        // samples accumulated
+  uint16_t blocks;   // blocks accumulated
+  float    mean;     // Welford running mean of block means (stillness check only)
+  float    m2;       // Welford sum of squared deviations
+};
+
+static void TareReset(struct tare_state *t) {
+  memset(t, 0, sizeof(*t));
+}
+
+// Accumulate one block. Returns 1 when the tare period is complete and still
+// (c0 written to *c0_off), 0 otherwise. A failed period resets and retries.
+static int TareAccumulate(struct tare_state *t, const struct accumulation_block *b, float *c0_off) {
+  t->sum += b->sum;
+  t->n   += b->n;
+  ++t->blocks;
+
+  float m = (float)b->sum / b->n;
+  float delta = m - t->mean;
+  t->mean += delta / t->blocks;
+  t->m2   += delta * (m - t->mean);
+
+  if (t->blocks % TARE_BLINK_BLOCKS == 0) HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+  if (t->blocks < TARE_BLOCKS) return 0;
+
+  float var = t->m2 / (t->blocks - 1);
+  int still = var <= TARE_MAX_STD * TARE_MAX_STD;
+  if (still) {
+    // double for the division: sum can exceed float's 24-bit exact range
+    *c0_off = (float)((double)t->sum / (double)t->n);
+  }
+  TareReset(t);
+  return still;
 }
 
 /* USER CODE END 0 */
@@ -179,20 +282,16 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
-  // Check encoder is connected and active
+  // Check encoder is connected and active. No UART messages: the downstream
+  // device only accepts single float lines. LD2 stays off while stuck here.
   HAL_StatusTypeDef status;
   status = HAL_I2C_IsDeviceReady (&hi2c1, ENCODER_I2C_ADDR, 3, 100);
-  if (status == HAL_OK) {
-    UART_Print("Encoder detected!\r\n");
-  }
-  else {
-    UART_Print("Encoder NOT detected!\r\n");
+  if (status != HAL_OK) {
     while (1);
   }
   do {
     status = AS5048_CheckSetup(&hi2c1, ENCODER_I2C_ADDR);
   } while(status != HAL_OK);
-  UART_Print("Encoder self-setup complete!\r\n");
 
   char msg[100];
 
@@ -201,16 +300,55 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   
-  struct raw_encoder_data data;
+  struct accumulation_block data;
+  struct moving_window window = {0};
+
+  // Tare runs first (boot), and again on each B1 press. The tare period (400
+  // blocks) is far longer than the moving window (10 blocks), so the window is
+  // always full by the time output starts - no separate warm-up state needed.
+  enum { STATE_TARING, STATE_RUNNING } state = STATE_TARING;
+  struct tare_state tare;
+  TareReset(&tare);
+  float c0_off = 0.0f;              // c0 as an offset from the fixed encoder ref
+  uint8_t b1_prev = 0;
+
   HAL_TIM_Base_Start_IT(&htim3); // Start sensor read timer
+
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
     while(RingPop(&data)) {
-      uint16_t value = AS5048_ConvertAngleBuffer(data.raw);
-      snprintf(msg, sizeof(msg), "%lu,%hu \r\n", data.seq, value);
+      MovingWindowAccumulate(&window, &data);
+
+      // B1 (active low) polled once per block (5 ms). Press -> restart tare
+      uint8_t b1 = HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET;
+      if (b1 && !b1_prev) {
+        TareReset(&tare);
+        HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+        state = STATE_TARING;
+      }
+      b1_prev = b1;
+
+      if (state == STATE_TARING) {
+        if (TareAccumulate(&tare, &data, &c0_off)) {
+          HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+          state = STATE_RUNNING;
+        }
+        continue;                   // silent while taring
+      }
+
+      // Filtered count as an offset from the fixed ref (exact integer sums,
+      // single float conversion). n_total > 0: CloseBlock never pushes an
+      // empty block. theta = c0 - count, positive with airspeed.
+      float filtered_off = (float)window.sum_total / window.n_total;
+      float v = quadratic_model(c0_off - filtered_off);
+      // float v = sqrt_model(c0_off - filtered_off);
+      // float v = cubic_model(c0_off - filtered_off);
+
+      // This MUST be in main loop for heap allocation - newlib not reentrant
+      snprintf(msg, sizeof(msg), "%.2f\r\n", (double)v);
       UART_Print(msg);
     }
 
@@ -236,12 +374,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
   RCC_OscInitStruct.PLL.PLLN = 336;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
   RCC_OscInitStruct.PLL.PLLQ = 4;
@@ -360,7 +497,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 921600;
+  huart2.Init.BaudRate = 115200;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;

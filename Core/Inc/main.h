@@ -36,7 +36,29 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
+#define MOVING_WINDOW_N 10
+#define AVG_N 10
+#define ENC_RANGE 16384
 
+struct accumulation_block {
+  uint32_t start_idx;
+  int32_t sum;
+  uint16_t ref;
+  uint8_t n;
+};
+
+// Trailing moving window over the last MOVING_WINDOW_N blocks. Holds the raw
+// integer block sums and sample counts, so the running totals are exact (no
+// float drift) and every sample is weighted equally even when a block is short.
+// Max |sum_total| = MOVING_WINDOW_N * AVG_N * ENC_RANGE/2 = 819200 -> int32.
+struct moving_window {
+  int32_t block_sum[MOVING_WINDOW_N];
+  uint8_t block_n[MOVING_WINDOW_N];
+  uint8_t blocks;      // number of blocks currently in the window (fills to MOVING_WINDOW_N)
+  uint8_t idx;         // slot the next block will be written to
+  int32_t sum_total;   // sum of block_sum[] (counts relative to the block ref)
+  uint16_t n_total;    // sum of block_n[] (samples in the window)
+};
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/
@@ -53,6 +75,10 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+
+int RingPush(struct accumulation_block *data);
+int RingPop(struct accumulation_block* data);
+void MovingWindowAccumulate(struct moving_window* window, const struct accumulation_block* block);
 
 /* USER CODE END EFP */
 
